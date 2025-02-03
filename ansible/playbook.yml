@@ -1,0 +1,165 @@
+---
+- name: Deploy Consul
+  hosts: all
+  become: true
+  vars:
+    vm_username: "{{ vm_username }}"
+    consul_config_dir: "/opt/consul/config"
+    consul_data_dir: "/opt/consul/data"
+    bootstrap_token: "{{ consul_bootstrap_token | default(omit) }}"
+
+  tasks:
+    - name: Show Ansible version. For troubleshooting
+      debug:
+        msg: "Ansible version is  {{ ansible_version.full }}"
+
+    - name: Check if this playbook has rebooted the machine before
+      ansible.builtin.stat:
+        path: /var/tmp/ansible_rebooted_this_machine_before.txt
+      register: reboot_file
+
+    - name: Reboot on the playbook's first run to start fresh after the changes made by user data
+      ansible.builtin.reboot:
+        post_reboot_delay: 10
+        connect_timeout: 120
+      when: not reboot_file.stat.exists
+      register: reboot_result
+
+    - name: Create file to indicate reboot happened on the playbook's first run
+      ansible.builtin.file:
+        path: /var/tmp/ansible_rebooted_this_machine_before.txt
+        state: touch
+      when:
+        - reboot_file.stat.exists == false
+        - reboot_result is succeeded
+
+    - name: Create Consul directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ vm_username }}"
+        group: "{{ vm_username }}"
+      loop:
+        - "{{ consul_config_dir }}"
+        - "{{ consul_data_dir }}"
+
+    - name: Copy Consul configuration file
+      ansible.builtin.copy:
+        src: consul.hcl
+        dest: "{{ consul_config_dir }}/consul.hcl"
+
+    - name: Copy Docker Compose file
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "/opt/consul/docker-compose.yml"
+
+    - name: Start Consul container
+      community.docker.docker_compose_v2:
+        project_src: "/opt/consul"
+        files:
+          - docker-compose.yml
+        state: present
+      become_user: "{{ vm_username }}"
+
+    - name: Wait for Consul to start
+      ansible.builtin.wait_for:
+        port: 8500
+        delay: 10
+    
+    - name: Bootstrap ACL system
+      command: docker exec consul consul acl bootstrap
+      register: acl_bootstrap
+      changed_when: true
+      become_user: "{{ vm_username }}"
+      when: bootstrap_token is not defined or bootstrap_token == ''
+
+    - name: Display newly created bootstrap token
+      ansible.builtin.debug:
+        var: acl_bootstrap.stdout
+      when: acl_bootstrap is defined and acl_bootstrap.stdout is defined
+      ignore_errors: true
+
+    - name: Extract new bootstrap token
+      set_fact:
+        bootstrap_token: "{{ acl_bootstrap.stdout | regex_search('SecretID:\\s+(\\S+)') | regex_replace('SecretID:\\s+', '') }}"
+      when: acl_bootstrap is defined and acl_bootstrap.stdout is defined
+
+    - name: Use existing bootstrap token
+      set_fact:
+        bootstrap_token: "{{ consul_bootstrap_token }}"
+      when: consul_bootstrap_token is defined and consul_bootstrap_token != ''
+
+    - name: Display bootstrap token. Useful for debugging
+      ansible.builtin.debug:
+        var: bootstrap_token
+
+    - name: Wait before attempting to use the bootstrap token
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify bootstrap token
+      ansible.builtin.uri:
+        url: "http://localhost:8500/v1/acl/token/self"
+        method: GET
+        headers:
+          X-Consul-Token: "{{ bootstrap_token }}"
+        status_code: 200
+      register: token_verification
+      failed_when: >
+        token_verification.status != 200 or
+        'global-management' not in token_verification.json.Policies | map(attribute='Name') | list
+
+    - name: Create ACL policies
+      community.general.consul_policy:
+        name: "{{ item.name }}"
+        rules: "{{ item.rules }}"
+        state: present
+        host: "localhost"
+        token: "{{ bootstrap_token }}"
+      loop:
+        - name: "write-policy"
+          rules: |
+            key_prefix "" {
+              policy = "write"
+            }
+        - name: "read-policy"
+          rules: |
+            key_prefix "" {
+              policy = "read"
+            }
+
+    - name: List existing ACL tokens
+      ansible.builtin.command:
+        cmd: docker exec consul consul acl token list -format=json --token {{ bootstrap_token }}
+      register: existing_tokens_output
+      changed_when: false
+
+    - name: Parse existing tokens
+      set_fact:
+        existing_tokens: "{{ existing_tokens_output.stdout | from_json }}"
+
+    - name: Display existing tokens
+      ansible.builtin.debug:
+        msg: "{{ existing_tokens }}"
+
+    - name: Create ACL tokens if they don't exist
+      community.general.consul_token:
+        description: "{{ item.description }}"
+        policies:
+          - name: "{{ item.policy }}"
+        state: present
+        host: "localhost"
+        token: "{{ bootstrap_token }}"
+      loop:
+        - description: "write-token"
+          policy: "write-policy"
+        - description: "read-token"
+          policy: "read-policy"
+      when: item.description not in (existing_tokens | map(attribute='Description') | list)
+      register: acl_tokens
+
+    - name: Display created tokens
+      ansible.builtin.debug:
+        msg: "Created tokens: {{ acl_tokens.results | selectattr('changed', 'equalto', true) | map(attribute='token') | list }}"
+      when: acl_tokens.changed
